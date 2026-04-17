@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="ACEO_KTL_Contractor_Tweaks/ACEO_KTL_Contractor_Tweaks.csproj" Id="d009dd43-c13f-4a5c-ac8e-f98ff2a45bb2" />
+  <Project Path="ACEO_KTL_Disaster_Tweaks/ACEO_KTL_Disaster_Tweaks.csproj" Id="20656ee7-515f-46d4-a68f-cdf694bc75ce" />
+  <Project Path="ACEO_KTL_Expenses_Tweaks/ACEO_KTL_Expenses_Tweaks.csproj" Id="a0595387-20ad-44bc-817e-e43382005feb" />
+  <Project Path="AECO_KTL_Economy_Tweaks/AECO_KTL_Economy_Tweaks.csproj" Id="069d6372-f6ee-4083-b7a2-5cee59f1df6c" />
+</Solution>
