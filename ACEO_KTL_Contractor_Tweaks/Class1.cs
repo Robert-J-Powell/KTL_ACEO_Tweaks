@@ -15,7 +15,7 @@ using UnityEngine;
 namespace KTL_Contract_Tweaks
 {
     // =========================================================================
-    // KTL_Contract_Tweaks  v1.0.1
+    // KTL_Contract_Tweaks  v1.0.2
     //
     // Part of KTL Contract Tweaks — configurable multipliers for non-airline
     // business contracts, plus optional airline negotiation suppression.
@@ -48,8 +48,7 @@ namespace KTL_Contract_Tweaks
     //   - CateringFoodSupplierModel.GetNegotiationValues   — catering renegotiation preview
     //   - DeicingFluidSupplierModel.get_CostPerLiter       — de-icing cost at runtime
     //   - DeicingFluidSupplierModel.GetNegotiationValues   — de-icing renegotiation preview
-    //   - BusinessController.AutoNegotiateBusinesses       — airline silent auto-renew
-    //   - EmailController.GenerateNegotiationEmail         — airline email suppression
+    //   - EmailController.GenerateNegotiationEmail         — airline silent auto-renew + email suppression
     //
     // Excluded by design:
     //   - Contractor count in negotiation panel (vanilla provides no such slider)
@@ -57,21 +56,38 @@ namespace KTL_Contract_Tweaks
     //   - Franchise and bank contracts          (out of scope)
     //
     // Notes on airline negotiation suppression:
-    //   When EnableAirlineNegotiation is false, two patches work together:
-    //   1. AirlineAutoNegotiatePatch — Prefix on BusinessController.AutoNegotiateBusinesses.
-    //      Intercepts the negotiable business list before vanilla processes it.
-    //      Any AirlineModel entries are silently resolved via NegotiateBusiness(contract, true)
-    //      — this commits the contract at its current slider values, clears negotiationActive,
-    //      and updates the sign date, without consuming negotiation points or moving any sliders.
-    //      Airlines are removed from the list before vanilla runs; if none remain the original
-    //      method is skipped entirely.  The flag is cleared at source so no UI cosmetic patches
-    //      are needed — the tile never turns orange.
-    //   2. AirlineNegotiationEmailPatch — filters airlines from the CFO email.
-    //      Suppresses the email entirely if no non-airline businesses remain.
+    //   When EnableAirlineNegotiation is false, a single patch handles everything:
+    //   AirlineNegotiationEmailPatch — Prefix on EmailController.GenerateNegotiationEmail.
+    //     At this point negotiationActive has already been set to true on all due
+    //     contracts and the businesses list contains only those due for renewal.
+    //     For each AirlineModel in the list, calls NegotiateBusiness(contract, true)
+    //     directly — this commits the contract at its current slider values, clears
+    //     negotiationActive, and updates the sign date, without consuming negotiation
+    //     points or moving any sliders.  Airlines are removed from the list in-place
+    //     before the email method runs.  If no non-airline businesses remain the email
+    //     is suppressed entirely by returning false.
+    //     This patch fires regardless of whether the player has auto-negotiate enabled,
+    //     correcting the v1.0.1 regression where airlines with auto-negotiate off were
+    //     left with negotiationActive = true, causing orange tiles and repeated daily
+    //     renewal prompts.
     //
     // =========================================================================
     // PATCH HISTORY
     // =========================================================================
+    //
+    // v1.0.2 — Airline orange tile regression fix (bug fix)
+    //   Root cause: AirlineAutoNegotiatePatch (BusinessController.AutoNegotiateBusinesses)
+    //   only fired when the player had auto-negotiate enabled in game settings.  With
+    //   auto-negotiate off, step 5 of UpdateDayHasPassed never ran, so negotiationActive
+    //   remained true on airline contracts — producing orange tiles, the Negotiate button,
+    //   and repeated daily renewal prompts.
+    //   Fix: Removed AirlineAutoNegotiatePatch entirely.  Consolidated silent auto-renew
+    //   and email suppression into AirlineNegotiationEmailPatch, a Prefix on
+    //   EmailController.GenerateNegotiationEmail.  This method is always called (CFO
+    //   permitting) regardless of the auto-negotiate setting, so the patch fires on every
+    //   renewal cycle.  Airlines are renewed via NegotiateBusiness(contract, true) and
+    //   removed from the list before the email method body executes; email is suppressed
+    //   if no non-airline businesses remain.
     //
     // v1.0.1 — Airline orange tile fix (bug fix)
     //   Replaced three-patch cosmetic suppression approach with a single
@@ -139,7 +155,7 @@ namespace KTL_Contract_Tweaks
     //
     // =========================================================================
 
-    [BepInPlugin("com.ktl.aceo.tweaks.contracts", "KTL Contract Tweaks", "1.0.1")]
+    [BepInPlugin("com.ktl.aceo.tweaks.contracts", "KTL Contract Tweaks", "1.0.2")]
     public class ContractorTweaksPlugin : BaseUnityPlugin
     {
         // =====================================================================
@@ -197,7 +213,7 @@ namespace KTL_Contract_Tweaks
 
         void Start()
         {
-            WatermarkUtils.Register(new WatermarkInfo("KTL-CT", "1.0.1", true));
+            WatermarkUtils.Register(new WatermarkInfo("KTL-CT", "1.0.2", true));
             Logger.LogInfo("KTL Contract Tweaks watermark registered.");
         }
 
@@ -323,10 +339,9 @@ namespace KTL_Contract_Tweaks
             TryPatch(harmony, typeof(CateringNegotiationPanelPatch), "CateringNegotiationPanelPatch");
             TryPatch(harmony, typeof(DeicingCostPatch), "DeicingCostPatch");
             TryPatch(harmony, typeof(DeicingNegotiationPanelPatch), "DeicingNegotiationPanelPatch");
-            TryPatch(harmony, typeof(AirlineAutoNegotiatePatch), "AirlineAutoNegotiatePatch");
             TryPatch(harmony, typeof(AirlineNegotiationEmailPatch), "AirlineNegotiationEmailPatch");
 
-            Logger.LogInfo("KTL Contract Tweaks 1.0.1 loaded.");
+            Logger.LogInfo("KTL Contract Tweaks 1.0.2 loaded.");
         }
 
         private static void TryPatch(Harmony harmony, System.Type patchType, string patchName)
@@ -624,43 +639,25 @@ namespace KTL_Contract_Tweaks
     // =========================================================================
 
     /// <summary>
-    /// Prefix on BusinessController.AutoNegotiateBusinesses.
-    /// Intercepts the negotiable business list before vanilla processes it.
+    /// Prefix on EmailController.GenerateNegotiationEmail.
+    /// This is the single consolidation point for airline silent auto-renewal and
+    /// CFO email suppression.  It fires on every annual renewal cycle regardless of
+    /// whether the player has auto-negotiate enabled in game settings — correcting
+    /// the v1.0.1 regression where AirlineAutoNegotiatePatch only ran when
+    /// AutoNegotiateBusinesses was called (auto-negotiate on), leaving airlines
+    /// with negotiationActive = true when auto-negotiate was off.
+    ///
+    /// At the point this method is called, negotiationActive has already been set
+    /// to true on all due airline contracts, and the businesses list contains only
+    /// those due for renewal (Franchise, Bank, and NegotiationsMaxed entries have
+    /// already been filtered by UpdateDayHasPassed).
+    ///
     /// For each AirlineModel in the list, calls NegotiateBusiness(contract, true)
     /// directly — this commits the contract at its current slider values, sets
     /// negotiationActive = false, and updates the sign date, without consuming
     /// any negotiation points or altering any slider positions.
-    /// Airlines are removed from the list before vanilla runs.
-    /// If no non-airline businesses remain, the original method is skipped entirely.
-    /// The flag is cleared at source so no UI cosmetic patches are required.
-    /// </summary>
-    [HarmonyPatch(typeof(BusinessController), "AutoNegotiateBusinesses")]
-    public static class AirlineAutoNegotiatePatch
-    {
-        [HarmonyPrefix]
-        public static bool Prefix(List<BusinessModel> negotiableBusiness)
-        {
-            if (ContractorTweaksPlugin.EnableAirlineNegotiation.Value) return true;
-
-            var controller = SingletonNonDestroy<BusinessController>.Instance;
-            if (controller == null) return true;
-
-            for (int i = negotiableBusiness.Count - 1; i >= 0; i--)
-            {
-                if (!(negotiableBusiness[i] is AirlineModel)) continue;
-                if (negotiableBusiness[i].contract != null)
-                    controller.NegotiateBusiness(negotiableBusiness[i].contract, true);
-                negotiableBusiness.RemoveAt(i);
-            }
-
-            return negotiableBusiness.Count > 0;
-        }
-    }
-
-    /// <summary>
-    /// Filters airlines from the CFO negotiation email.
-    /// Removes AirlineModel entries from the shared list in-place.
-    /// Suppresses the email entirely if no non-airline businesses remain.
+    /// Airlines are removed from the list in-place before the email method body runs.
+    /// If no non-airline businesses remain, returns false to suppress the email entirely.
     /// </summary>
     [HarmonyPatch(typeof(EmailController), "GenerateNegotiationEmail")]
     public static class AirlineNegotiationEmailPatch
@@ -669,11 +666,18 @@ namespace KTL_Contract_Tweaks
         public static bool Prefix(List<BusinessModel> negotiableBusinesses)
         {
             if (ContractorTweaksPlugin.EnableAirlineNegotiation.Value) return true;
+
+            var controller = SingletonNonDestroy<BusinessController>.Instance;
+            if (controller == null) return true;
+
             for (int i = negotiableBusinesses.Count - 1; i >= 0; i--)
             {
-                if (negotiableBusinesses[i] is AirlineModel)
-                    negotiableBusinesses.RemoveAt(i);
+                if (!(negotiableBusinesses[i] is AirlineModel)) continue;
+                if (negotiableBusinesses[i].contract != null)
+                    controller.NegotiateBusiness(negotiableBusinesses[i].contract, true);
+                negotiableBusinesses.RemoveAt(i);
             }
+
             return negotiableBusinesses.Count > 0;
         }
     }
