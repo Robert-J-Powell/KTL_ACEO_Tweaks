@@ -15,7 +15,7 @@ using UnityEngine;
 namespace KTL_Contract_Tweaks
 {
     // =========================================================================
-    // KTL_Contract_Tweaks  v1.0.1
+    // KTL_Contract_Tweaks  v1.0.0
     //
     // Part of KTL Contract Tweaks — configurable multipliers for non-airline
     // business contracts, plus optional airline negotiation suppression.
@@ -48,8 +48,9 @@ namespace KTL_Contract_Tweaks
     //   - CateringFoodSupplierModel.GetNegotiationValues   — catering renegotiation preview
     //   - DeicingFluidSupplierModel.get_CostPerLiter       — de-icing cost at runtime
     //   - DeicingFluidSupplierModel.GetNegotiationValues   — de-icing renegotiation preview
-    //   - BusinessController.AutoNegotiateBusinesses       — airline silent auto-renew
     //   - EmailController.GenerateNegotiationEmail         — airline email suppression
+    //   - ContractPanelUI.UpdatePanel                      — airline tile colour suppression
+    //   - SelectedContractUI.SetContractPanelValues        — airline negotiate button suppression
     //
     // Excluded by design:
     //   - Contractor count in negotiation panel (vanilla provides no such slider)
@@ -57,30 +58,19 @@ namespace KTL_Contract_Tweaks
     //   - Franchise and bank contracts          (out of scope)
     //
     // Notes on airline negotiation suppression:
-    //   When EnableAirlineNegotiation is false, two patches work together:
-    //   1. AirlineAutoNegotiatePatch — Prefix on BusinessController.AutoNegotiateBusinesses.
-    //      Intercepts the negotiable business list before vanilla processes it.
-    //      Any AirlineModel entries are silently resolved via NegotiateBusiness(contract, true)
-    //      — this commits the contract at its current slider values, clears negotiationActive,
-    //      and updates the sign date, without consuming negotiation points or moving any sliders.
-    //      Airlines are removed from the list before vanilla runs; if none remain the original
-    //      method is skipped entirely.  The flag is cleared at source so no UI cosmetic patches
-    //      are needed — the tile never turns orange.
-    //   2. AirlineNegotiationEmailPatch — filters airlines from the CFO email.
-    //      Suppresses the email entirely if no non-airline businesses remain.
+    //   When EnableAirlineNegotiation is false, three patches work together:
+    //   1. AirlineNegotiationEmailPatch — filters airlines from the CFO email.
+    //   2. AirlineContractTilesPatch — Prefix on ContractPanelUI.UpdatePanel.
+    //      Sweeps negotiationActive = false on all airline contracts by walking
+    //      BusinessController.allBusinessArray directly via reflection — this
+    //      accesses the raw live backing array rather than a filtered copy,
+    //      ensuring the flags are cleared before tile colours are rendered.
+    //   3. AirlineNegotiationPanelPatch — Prefix on SetContractPanelValues.
+    //      Belt-and-braces reset for the individual contract panel view.
     //
     // =========================================================================
     // PATCH HISTORY
     // =========================================================================
-    //
-    // v1.0.1 — Airline orange tile fix (bug fix)
-    //   Replaced three-patch cosmetic suppression approach with a single
-    //   AirlineAutoNegotiatePatch on BusinessController.AutoNegotiateBusinesses.
-    //   Airlines are now silently auto-renewed at current terms via
-    //   NegotiateBusiness(contract, true) — clearing negotiationActive at source
-    //   before any UI frame reads it.  No negotiation points consumed, no sliders
-    //   moved, no email sent.  AirlineContractTilesPatch, AirlineNegotiationPanelPatch,
-    //   and SweepAirlineNegotiationFlags removed as no longer required.
     //
     // v1.0.0 — Version bump to stable. Namespace renamed to KTL_Contract_Tweaks.
     //   Known limitation acknowledged: on saves with a pending contract negotiation
@@ -139,7 +129,7 @@ namespace KTL_Contract_Tweaks
     //
     // =========================================================================
 
-    [BepInPlugin("com.ktl.aceo.tweaks.contracts", "KTL Contract Tweaks", "1.0.1")]
+    [BepInPlugin("com.ktl.aceo.tweaks.contracts", "KTL Contract Tweaks", "1.0.0")]
     public class ContractorTweaksPlugin : BaseUnityPlugin
     {
         // =====================================================================
@@ -181,6 +171,10 @@ namespace KTL_Contract_Tweaks
         internal static new ManualLogSource Logger;
         private bool _isNormalizingConfig;
 
+        // Cached reflection field for BusinessController.allBusinessArray.
+        // Populated once on Awake — avoids per-frame reflection cost.
+        private static FieldInfo _allBusinessArrayField;
+
         // =====================================================================
         // Lifecycle
         // =====================================================================
@@ -197,12 +191,51 @@ namespace KTL_Contract_Tweaks
 
         void Start()
         {
-            WatermarkUtils.Register(new WatermarkInfo("KTL-CT", "1.0.1", true));
+            WatermarkUtils.Register(new WatermarkInfo("KTL-CT", "1.0.0", true));
             Logger.LogInfo("KTL Contract Tweaks watermark registered.");
         }
 
         private static void CacheReflectionFields()
         {
+            _allBusinessArrayField = AccessTools.Field(typeof(BusinessController), "allBusinessArray");
+            if (_allBusinessArrayField == null)
+                Logger.LogWarning("Could not cache allBusinessArray field — AirlineContractTilesPatch may not function.");
+            else
+                Logger.LogInfo("allBusinessArray field cached.");
+        }
+
+        /// <summary>
+        /// Sweeps negotiationActive = false on all AirlineModel contracts by
+        /// walking the raw allBusinessArray backing array.  Called from
+        /// AirlineContractTilesPatch before tile colours are rendered.
+        /// </summary>
+        public static void SweepAirlineNegotiationFlags()
+        {
+            if (_allBusinessArrayField == null) return;
+
+            var controller = SingletonNonDestroy<BusinessController>.Instance;
+            if (controller == null) return;
+
+            // allBusinessArray is a DynamicArray<BusinessModel>.
+            // We access .array (the raw BusinessModel[]) and .Length directly.
+            var dynamicArray = _allBusinessArrayField.GetValue(controller);
+            if (dynamicArray == null) return;
+
+            var arrayField = AccessTools.Field(dynamicArray.GetType(), "array");
+            var lengthField = AccessTools.Field(dynamicArray.GetType(), "Length");
+            if (arrayField == null || lengthField == null) return;
+
+            var rawArray = arrayField.GetValue(dynamicArray) as BusinessModel[];
+            int length = (int)lengthField.GetValue(dynamicArray);
+            if (rawArray == null) return;
+
+            for (int i = 0; i < length; i++)
+            {
+                BusinessModel bm = rawArray[i];
+                if (bm == null) continue;
+                if (bm is AirlineModel && bm.contract != null && bm.contract.negotiationActive)
+                    bm.contract.negotiationActive = false;
+            }
         }
 
         // =====================================================================
@@ -298,9 +331,10 @@ namespace KTL_Contract_Tweaks
                 "5. Airlines", "EnableAirlineNegotiation", true,
                 "True (default) = vanilla behaviour. Airlines renegotiate each year — " +
                 "the CFO sends the negotiation email and terms can change. " +
-                "False = airline contracts auto-renew silently at their current terms. " +
-                "No negotiation points are spent, no sliders move, no orange tile appears, " +
-                "and no CFO email is sent. The renewal happens invisibly each year.");
+                "False = airline renegotiation suppressed. Terms roll over at current " +
+                "values each year, no Negotiate button appears, no orange tile, and " +
+                "airlines are omitted from the CFO negotiation email (email suppressed " +
+                "entirely if no other contracts are due that year).");
         }
 
         // =====================================================================
@@ -323,10 +357,11 @@ namespace KTL_Contract_Tweaks
             TryPatch(harmony, typeof(CateringNegotiationPanelPatch), "CateringNegotiationPanelPatch");
             TryPatch(harmony, typeof(DeicingCostPatch), "DeicingCostPatch");
             TryPatch(harmony, typeof(DeicingNegotiationPanelPatch), "DeicingNegotiationPanelPatch");
-            TryPatch(harmony, typeof(AirlineAutoNegotiatePatch), "AirlineAutoNegotiatePatch");
             TryPatch(harmony, typeof(AirlineNegotiationEmailPatch), "AirlineNegotiationEmailPatch");
+            TryPatch(harmony, typeof(AirlineContractTilesPatch), "AirlineContractTilesPatch");
+            TryPatch(harmony, typeof(AirlineNegotiationPanelPatch), "AirlineNegotiationPanelPatch");
 
-            Logger.LogInfo("KTL Contract Tweaks 1.0.1 loaded.");
+            Logger.LogInfo("KTL Contract Tweaks 1.0.0 loaded.");
         }
 
         private static void TryPatch(Harmony harmony, System.Type patchType, string patchName)
@@ -624,42 +659,9 @@ namespace KTL_Contract_Tweaks
     // =========================================================================
 
     /// <summary>
-    /// Prefix on BusinessController.AutoNegotiateBusinesses.
-    /// Intercepts the negotiable business list before vanilla processes it.
-    /// For each AirlineModel in the list, calls NegotiateBusiness(contract, true)
-    /// directly — this commits the contract at its current slider values, sets
-    /// negotiationActive = false, and updates the sign date, without consuming
-    /// any negotiation points or altering any slider positions.
-    /// Airlines are removed from the list before vanilla runs.
-    /// If no non-airline businesses remain, the original method is skipped entirely.
-    /// The flag is cleared at source so no UI cosmetic patches are required.
-    /// </summary>
-    [HarmonyPatch(typeof(BusinessController), "AutoNegotiateBusinesses")]
-    public static class AirlineAutoNegotiatePatch
-    {
-        [HarmonyPrefix]
-        public static bool Prefix(List<BusinessModel> negotiableBusiness)
-        {
-            if (ContractorTweaksPlugin.EnableAirlineNegotiation.Value) return true;
-
-            var controller = SingletonNonDestroy<BusinessController>.Instance;
-            if (controller == null) return true;
-
-            for (int i = negotiableBusiness.Count - 1; i >= 0; i--)
-            {
-                if (!(negotiableBusiness[i] is AirlineModel)) continue;
-                if (negotiableBusiness[i].contract != null)
-                    controller.NegotiateBusiness(negotiableBusiness[i].contract, true);
-                negotiableBusiness.RemoveAt(i);
-            }
-
-            return negotiableBusiness.Count > 0;
-        }
-    }
-
-    /// <summary>
     /// Filters airlines from the CFO negotiation email.
-    /// Removes AirlineModel entries from the shared list in-place.
+    /// Removes AirlineModel entries from the shared list in-place — also
+    /// prevents auto-negotiation acting on them in the same cycle.
     /// Suppresses the email entirely if no non-airline businesses remain.
     /// </summary>
     [HarmonyPatch(typeof(EmailController), "GenerateNegotiationEmail")]
@@ -675,6 +677,46 @@ namespace KTL_Contract_Tweaks
                     negotiableBusinesses.RemoveAt(i);
             }
             return negotiableBusinesses.Count > 0;
+        }
+    }
+
+    /// <summary>
+    /// Sweeps negotiationActive = false on all airline contracts before
+    /// ContractPanelUI.UpdatePanel renders the tile list.
+    ///
+    /// Walks BusinessController.allBusinessArray directly via reflection
+    /// rather than using GetListOfActiveBusinessesByType — the latter returns
+    /// a filtered copy and any flag resets would not affect the live models.
+    /// The raw array contains the live BusinessModel instances; resetting flags
+    /// here persists to every subsequent read in the same frame.
+    /// </summary>
+    [HarmonyPatch(typeof(ContractPanelUI), "UpdatePanel")]
+    public static class AirlineContractTilesPatch
+    {
+        [HarmonyPrefix]
+        public static void Prefix()
+        {
+            if (ContractorTweaksPlugin.EnableAirlineNegotiation.Value) return;
+            ContractorTweaksPlugin.SweepAirlineNegotiationFlags();
+        }
+    }
+
+    /// <summary>
+    /// Belt-and-braces Prefix on SetContractPanelValues.
+    /// Resets negotiationActive = false on the specific airline contract before
+    /// vanilla renders the panel, ensuring correct state on first open even if
+    /// the tile sweep hasn't run yet (e.g. panel opened before economy panel).
+    /// </summary>
+    [HarmonyPatch(typeof(SelectedContractUI), "SetContractPanelValues")]
+    public static class AirlineNegotiationPanelPatch
+    {
+        [HarmonyPrefix]
+        public static void Prefix(BusinessModel business)
+        {
+            if (ContractorTweaksPlugin.EnableAirlineNegotiation.Value) return;
+            if (!(business is AirlineModel)) return;
+            if (business.contract != null && business.contract.negotiationActive)
+                business.contract.negotiationActive = false;
         }
     }
 }
