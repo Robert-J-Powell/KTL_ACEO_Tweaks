@@ -9,6 +9,7 @@ using UnityEngine;
 
 // References required:
 //   AirportCEOModLoader.dll (D:\SteamLibrary\steamapps\workshop\content\673610\3109136766\plugins\AirportCEOModLoader.dll)
+// Revert to vanilla Upload
 
 namespace ACEO_KTL_Expenses_Tweaks
 {
