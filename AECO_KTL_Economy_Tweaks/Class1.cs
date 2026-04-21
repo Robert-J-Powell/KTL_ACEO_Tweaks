@@ -6,211 +6,77 @@ using BepInEx.Logging;
 using HarmonyLib;
 using System.Collections.Generic;
 using System.Reflection;
+using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 
 // References required:
-//   Unity.TextMeshPro.dll  (for ValueSliderContainerUI — resolved transitively)
+//   Unity.TextMeshPro.dll  (direct reference required; used by InjectOneStandSlider)
 //   AirportCEOModLoader.dll (D:\SteamLibrary\steamapps\workshop\content\673610\3109136766\plugins\AirportCEOModLoader.dll)
 
 namespace ACEO_KTL_Economy_Tweaks
 {
     // =========================================================================
-    // ACEO_KTL_Economy_Tweaks  v1.1.2
+    // ACEO_KTL_Economy_Tweaks  v1.2.4
     //
-    // Applies configurable multipliers to sixteen airport income fee categories:
-    //   2. Runways        — small, medium, and large aircraft runway usage fees
-    //   3. Stands         — small/GA, medium, and large stand parking fees
-    //   4. Aircraft Svc   — hangar repair, cabin cleaning, de-icing, catering
-    //   5. Handling       — baggage handling and passenger handling fees
-    //   6. Parking        — short-term and long-term car parking fees
-    //   7. Fuel           — Avgas 100LL and Jet A1 fuel charges
+    // Configurable multipliers for sixteen airport income fee categories:
+    //   2. Runways      — small, medium, large runway usage fees
+    //   3. Stands       — small/GA, medium, large stand parking fees
+    //   4. Aircraft Svc — hangar repair, cabin cleaning, de-icing, catering
+    //   5. Handling     — baggage and passenger handling fees
+    //   6. Parking      — short-term and long-term car parking fees
+    //   7. Fuel         — Avgas 100LL and Jet A1 fuel charges
     //
-    // Excluded by design:
-    //   - Bathroom entrance fee   (vanilla default is £0; scaling zero is useless)
-    //   - Vending machine markup  (minor passenger-facing charge; not airline-linked)
-    //   - Staff wages             (separate concern)
-    //   - Contractors             (covered by KTL Contractor Tweaks)
-    //   - Supply purchases        (contract-driven procurement costs)
-    //   - Loans                   (contractually fixed obligations)
+    // Excluded: bathroom fee (vanilla £0), vending markup, staff wages,
+    //   contractors (KTL Contractor Tweaks), supply purchases, loans.
+    //
+    // Language: English only. Injected stand slider labels are not localised;
+    //   the vanilla LocalizedTextMeshPro component is disabled on cloned rows.
     //
     // Architecture:
-    //   All vanilla fee defaults equal FeeMax / 2 (confirmed from EconomyData.cs).
-    //   A base fee cache is seeded once per session from EconomyData at load or
-    //   new game.  Multipliers are always applied as: scaledFee = base × multiplier.
-    //   The base cache is never written to by sliders or save/load — it is the
-    //   permanent vanilla reference for the session.
-    //
-    //   Rating evaluation curves are rebuilt after every multiplier application so
-    //   that the green/orange/red bands in both the Fees panel and the report bars
-    //   always reflect the scaled fee range correctly.
-    //
-    //   The in-game Fees panel sliders are extended to span the full scaled range:
-    //   slider MaxValue = vanillaMax × multiplier, MinValue = vanillaMin × multiplier,
-    //   step = vanillaStep × multiplier.  Slider values are written directly to the
-    //   inner Unity Slider component via reflection to bypass the vanilla
-    //   OnValueChanged listener chain, preventing vanilla from writing back to
-    //   EconomyData during programmatic updates.
-    //
-    //   Each slider-mapped fee tracks the snapped multiplier value that was active
-    //   the last time ApplyEconomyFeeMultipliers() wrote it.  On every hourly tick
-    //   the current multiplier is compared against this cache.  If they match, the
-    //   player's dragged EconomyData value is left untouched.  If they differ, the
-    //   fee resets to base × multiplier and the cache is updated.
+    //   Base fee cache seeded once from EconomyData vanilla defaults (= FeeMax/2).
+    //   scaledFee = base × multiplier; cache never mutated by sliders or save/load.
+    //   Rating curves rebuilt after each application so panel colour bands scale correctly.
+    //   Sliders written via inner Unity Slider reflection to bypass OnValueChanged chain.
+    //   Per-slider LastAppliedMultiplier guards player-dragged values from hourly resets.
     //
     // =========================================================================
     // PATCH HISTORY
     // =========================================================================
     //
-    // v1.0.6 — Initial public release
-    //   Fee multipliers applied via EconomyData field writes on
-    //   UpdateHourlyBalanceUI, FeesPanelUI.InitializePanel, and
-    //   FeesPanelUI.LoadPanel.
-    //   Base fee cache seeded once per session from vanilla defaults.
-    //   Rating evaluation curves refreshed after each multiplier application
-    //   so the fees panel green/orange/red colour bands scale correctly with
-    //   the active multiplier.
-    //   Known issue: Report bar satisfaction ratings (GA, airline, passenger)
-    //   show orange/red even at default multiplier settings.  Root cause:
-    //   BuildCurve() pivoted around the scaled live fee and used fixed ratios
-    //   (1.25× / 1.75×) that are incompatible with the vanilla curve's
-    //   coordinate space.  The report bar evaluates the raw live fee value
-    //   against the curve; with the curve anchored incorrectly, any multiplied
-    //   fee reads as mid-to-high dissatisfaction.
+    // v1.2.4 — [DIAG] LogStandSliderChildren added to InjectStandSliders. Fires once on
+    //           SmallStandParkingFee source row to identify tooltip child name and component
+    //           type. No version bump — diagnostic only.
+    //         — Label fix: LocalizedTextMeshPro component disabled on cloned stand slider
+    //           rows and source Small/GA row before setting label text. This component was
+    //           overwriting our text with the vanilla localised string after every write.
+    //           Diagnostic (LogSliderDescriptionComponents) removed; cause confirmed.
+    //           English-only language note added to mod header.
     //
-    // v1.0.7 — Report bar rating curve fix
-    //   Fixed: BuildCurve() now replicates the vanilla AirportRatingManager
-    //   InitializeEvaluationCurve() formula exactly, scaled by the active
-    //   multiplier.  All vanilla fee defaults equal FeeMax / 2, so
-    //   scaledFeeMax = baseFee * 2 * multiplier reconstructs the vanilla
-    //   FeeMax scaled to the current slider setting.
-    //   The curve is then built as EaseInOut(scaledFeeMax * 0.4f, 1f,
-    //   scaledFeeMax, 0f) — identical to vanilla, but shifted proportionally
-    //   with the multiplier.  At the default multiplier of 1.0 the curve is
-    //   bit-identical to what vanilla initialises.  At higher multipliers the
-    //   green zone scales up commensurately, so a 2× runway fee reads green
-    //   in the report bar, not orange/red.
-    //   BuildCurve() now takes (baseFee, multiplier) instead of (neutralFee).
-    //   All RefreshAirportRatingEvaluationCurves() call sites updated to pass
-    //   the corresponding base cache value and snapped multiplier.
+    // v1.2.3 — ForceMeshUpdate() added to label writes. Diagnostic added to identify
+    //           localisation component overwriting labels (confirmed: LocalizedTextMeshPro).
     //
-    // v1.0.8 — Slider drag no longer snaps back to multiplier midpoint
-    //   Fixed: ApplyB2FeesPanelOverrides() called ApplyEconomyFeeMultipliers()
-    //   unconditionally at its end.  When triggered by a player slider drag, this
-    //   immediately overwrote the player's chosen value with base × multiplier
-    //   (i.e. FeeMax / 2 at the default 1.0 multiplier), making all sliders snap
-    //   back to the middle regardless of where they were dragged.
-    //   ApplyEconomyFeeMultipliers() sets the baseline fee from config and must
-    //   only run at session start and on the hourly tick — not after every drag.
-    //   Removed the erroneous call from ApplyB2FeesPanelOverrides().
+    // v1.2.2 — SliderDef.IsInjected flag; ResolveSlider skips reflection for injected
+    //           defs. Label rewrite tries TextMeshProUGUI then TextMeshPro as fallback.
     //
-    // v1.0.9 — Diagnostic logging (testing only; reduced in v1.1.0)
-    //   Added verbose BepInEx logging to all fee-write paths to assist diagnosis
-    //   of slider snap-back issues.  Logging scope reduced in v1.1.0 now that the
-    //   root cause has been identified and fixed.
+    // v1.2.1 — Injected sliders seeded from EconomyData. Small/GA label corrected.
+    //           Behaviour logging added to InjectOneStandSlider.
     //
-    // v1.1.0 — Slider event chain rewrite + MinValue + input snapping (bug fix)
-    //   Root cause identified: ValueSliderContainerUI.Awake() registers its own
-    //   internal OnValueChanged listener that calls RoundValueChanged() then
-    //   UpdateContainer() synchronously on every slider.Value assignment.  Vanilla's
-    //   FeesPanelUI.InitializePanel() registers a second listener that writes the
-    //   slider value back to EconomyData.  Neither listener checks
-    //   IsSyncingFeesPanelDisplay, so every programmatic write inside
-    //   ApplyB2FeesPanelOverrides() triggered both, causing vanilla to overwrite
-    //   EconomyData with its own snapped value immediately after the mod set it.
-    //   This produced the observed snap-back on first drag and after every panel open.
+    // v1.2.0 — Medium/large stand fees promoted to in-game sliders. Cloned from
+    //           SmallStandParkingFee at runtime. Removed from "always apply" block.
     //
-    //   Fix 1 — Direct inner Slider write.  ApplyB2FeesPanelOverrides() now
-    //   reflects to the private Slider field inside ValueSliderContainerUI and
-    //   writes slider.value, slider.minValue, and slider.maxValue directly,
-    //   bypassing the ValueSliderContainerUI.Value property setter and its event
-    //   chain entirely.  UpdateContainer() is still called afterwards to refresh
-    //   the displayed text and colour.
+    // v1.1.x — Slider event chain rewrite; player drag persistence; LoadPanel guard.
     //
-    //   Fix 2 — Vanilla listener suppression.  Before the write loop,
-    //   ApplyB2FeesPanelOverrides() removes all listeners from each slider's
-    //   onValueChanged event, writes the values directly, then restores all
-    //   listeners.  This prevents vanilla's InitializePanel listener from writing
-    //   back to EconomyData during the programmatic update.
-    //
-    //   Fix 3 — Input-side snapping.  AttachB2FeesPanelListeners() now snaps the
-    //   raw drag value to the nearest displayStep multiple before writing to
-    //   EconomyData.  This ensures the value written is always on the mod's step
-    //   grid, so the subsequent ApplyB2FeesPanelOverrides() call writes the same
-    //   value back to the slider and vanilla's round step has nothing to re-snap.
-    //
-    //   Fix 4 — FeesPanelInitPatch now calls ApplyB2FeesPanelOverrides() after
-    //   AttachB2FeesPanelListeners().  Previously the slider ranges were not set
-    //   until LoadPanel, so a player drag before the first panel open would fire
-    //   with the slider at its uninitialised Unity default position (minValue = 1),
-    //   writing £1 to EconomyData.  The subsequent hourly tick then reset the field
-    //   to base × multiplier.
-    //
-    //   SliderDef gains VanillaMin to support scaled minValue.  The inner Slider
-    //   field is cached once per panel instance via GetInnerSlider().
-    //
-    //   Diagnostic logging reduced to entry/exit lines and change-only multiplier
-    //   writes.  Per-slider dump removed.
-    //
-    // v1.1.1 — Player drag values persist across hourly ticks (bug fix)
-    //   Root cause: ApplyEconomyFeeMultipliers() ran unconditionally on every
-    //   hourly tick (EconomyFeeRefreshPatch), overwriting all EconomyData fee
-    //   fields with base × multiplier and discarding any value the player had
-    //   dragged the slider to.
-    //   Fix: SliderDef gains LastAppliedMultiplier (float, default -1f).
-    //   ApplyEconomyFeeMultipliers() now only writes a slider-mapped fee when
-    //   the current snapped multiplier differs from the cached value.  If they
-    //   match, the EconomyData field is left untouched and the player's dragged
-    //   value persists.  When the multiplier changes, the fee resets to
-    //   base × multiplier and the cache is updated.
-    //   Non-slider fees (medium and large stand parking) are unaffected — they
-    //   have no player drag path and continue to apply unconditionally.
-    //   LastAppliedMultiplier is reset to -1f on session load and new game so
-    //   the midpoint is re-established cleanly from the fresh base cache.
-    //
-    // v1.1.2 — LoadPanel pre-cache guard + diagnostic logging removed (bug fix / perf)
-    //   Fixed: FeesPanelDisplayPatch called ApplyB2FeesPanelOverrides() even when
-    //   LoadPanel fired before OnSaveLoaded had finished seeding the base cache.
-    //   This produced multiple redundant ApplyOverrides passes during session load,
-    //   writing stale save-stored values to the sliders before the correct
-    //   multiplied values were available.  The final values were always correct
-    //   but the intermediate passes were wasted work and showed misleading values
-    //   momentarily.
-    //   Fix: FeesPanelDisplayPatch now guards on BaseFeeCacheInitialized before
-    //   calling ApplyB2FeesPanelOverrides().  LoadPanel calls that arrive before
-    //   the cache is ready are silently skipped; FeesPanelInitPatch handles the
-    //   correct initial write once the cache is seeded.
-    //   All LogDebug call sites removed.  LogInfo retained for session lifecycle
-    //   events (cache init, new game, config normalisation).
+    // v1.0.6 — Initial public release.
     //
     // =========================================================================
 
-    // -------------------------------------------------------------------------
-    // SliderDef
-    //
-    // Describes one entry in the in-game Fees panel slider table.
-    //
-    // FieldName     — private field name on FeesPanelUI that holds the
-    //                 ValueSliderContainerUI instance for this fee.  Resolved
-    //                 once per panel instance via AccessTools reflection.
-    // VanillaMin    — the vanilla slider minimum for this fee.  Used to compute
-    //                 the scaled slider MinValue: displayMin = VanillaMin × multiplier.
-    // VanillaMax    — the vanilla FeeMax constant for this fee (from EconomyData).
-    //                 Used to compute the scaled slider MaxValue at runtime:
-    //                 displayMax = VanillaMax × multiplier.
-    // DisplayStep   — the vanilla slider snap step.  Scaled the same way:
-    //                 displayStep = DisplayStep × multiplier, so the step
-    //                 stays proportional to the range at any multiplier.
-    // GetMultiplier — delegate returning the current snapped multiplier value
-    //                 for this fee.  Called each time the panel is refreshed.
-    // Slider        — resolved reference to the live UI slider wrapper.  Null
-    //                 until ResolveSlider() is called against a FeesPanelUI instance.
-    // LastAppliedMultiplier — the snapped multiplier value that was active the
-    //                 last time ApplyEconomyFeeMultipliers() wrote this fee.
-    //                 Initialised to -1f so the first application always writes.
-    //                 Reset to -1f on session boundaries (load / new game) so the
-    //                 midpoint is re-established cleanly from the fresh base cache.
-    // -------------------------------------------------------------------------
+    // SliderDef — one entry in the Fees panel slider table.
+    //   FieldName/VanillaMin/VanillaMax/DisplayStep — resolved via reflection at init.
+    //   GetMultiplier — delegate returning the current snapped multiplier for this fee.
+    //   LastAppliedMultiplier — guards player-dragged values from hourly resets (-1f = force write).
+    //   IsInjected — marks runtime-injected sliders; ResolveSlider skips reflection for these
+    //                to preserve the manually-assigned Slider reference set by InjectOneStandSlider.
     internal sealed class SliderDef
     {
         public string FieldName { get; }
@@ -219,13 +85,10 @@ namespace ACEO_KTL_Economy_Tweaks
         public float DisplayStep { get; }
         public System.Func<float> GetMultiplier { get; }
         public ValueSliderContainerUI Slider { get; set; }
+        public bool IsInjected { get; set; }
 
-        // Cached reference to the private Unity Slider inside the wrapper.
-        // Populated by GetInnerSlider() on first access.
         private Slider _innerSlider;
 
-        // Tracks the snapped multiplier last written by ApplyEconomyFeeMultipliers().
-        // -1f forces a write on the first call regardless of the config value.
         public float LastAppliedMultiplier = -1f;
 
         public SliderDef(string fieldName, float vanillaMin, float vanillaMax, float displayStep, System.Func<float> getMultiplier)
@@ -239,6 +102,9 @@ namespace ACEO_KTL_Economy_Tweaks
 
         public void ResolveSlider(FeesPanelUI feesPanel)
         {
+            // Injected sliders are assigned directly in InjectOneStandSlider; reflection
+            // cannot find them on FeesPanelUI and would null out the reference if attempted.
+            if (IsInjected) return;
             FieldInfo field = AccessTools.Field(typeof(FeesPanelUI), FieldName);
             Slider = field?.GetValue(feesPanel) as ValueSliderContainerUI;
             _innerSlider = null; // invalidate cache when panel instance changes
@@ -259,86 +125,48 @@ namespace ACEO_KTL_Economy_Tweaks
     // =========================================================================
     // GrandMasterPlugin
     // =========================================================================
-    [BepInPlugin("com.ktl.aceo.tweaks.economy", "KTL Economy Tweaks", "1.1.2")]
+    [BepInPlugin("com.ktl.aceo.tweaks.economy", "KTL Economy Tweaks", "1.2.4")]
     public class GrandMasterPlugin : BaseUnityPlugin
     {
-        // -------------------------------------------------------------------------
-        // BepInEx config entries — one per fee category multiplier.
-        // All bound in BindConfig() with explicit AcceptableValueRange so the
-        // BepInEx config manager enforces min/max without additional clamping.
-        // -------------------------------------------------------------------------
-
+        // Config entries — one per fee category multiplier. Bound with AcceptableValueRange.
         public static ConfigEntry<bool> EnableEconomy;
 
-        // Runway fees — charged to airlines per landing/takeoff.
-        // Vanilla defaults: Small £500, Medium £1,500, Large £2,500.
+        // Runway fees. Vanilla: Small £500, Medium £1,500, Large £2,500.
         public static ConfigEntry<float> SmallRunwayIncome;
         public static ConfigEntry<float> MediumRunwayIncome;
         public static ConfigEntry<float> LargeRunwayIncome;
 
-        // Stand parking fees — charged to airlines per stand occupancy hour.
-        // Vanilla defaults: Small £400, Medium £500, Large £600.
-        // Note: only smallStandParkingSlider exists in FeesPanelUI.  Medium and
-        // large stand fees are applied via ApplyEconomyFeeMultipliers() directly;
-        // they have no corresponding in-game slider and cannot be dragged manually.
+        // Stand parking fees. Vanilla: Small/GA £400, Medium £500, Large £600.
+        // All three have in-game sliders; medium and large are injected at runtime.
         public static ConfigEntry<float> SmallStandIncome;
         public static ConfigEntry<float> MediumStandIncome;
         public static ConfigEntry<float> LargeStandIncome;
 
-        // Aircraft service fees — charged to airlines per aircraft serviced.
-        // Vanilla defaults: Hangar Repair £600, Cabin Cleaning £2.50/aircraft,
-        //   De-icing Fluid £10/litre, Catering Meal £5/meal.
+        // Aircraft service fees. Vanilla: Hangar Repair £600, Cabin Cleaning £2.50, De-icing £10/L, Catering £5/meal.
         public static ConfigEntry<float> HangarRepairIncome;
         public static ConfigEntry<float> CabinCleaningIncome;
         public static ConfigEntry<float> DeicingFluidIncome;
         public static ConfigEntry<float> CateringMealIncome;
 
-        // Handling fees — charged to airlines per passenger or bag processed.
-        // Vanilla defaults: Baggage Handling £10, Passenger Handling £15.
+        // Handling fees. Vanilla: Baggage £10, Passenger £15.
         public static ConfigEntry<float> BaggageHandlingIncome;
         public static ConfigEntry<float> PassengerHandlingIncome;
 
-        // Car parking fees — charged directly to passengers.
-        // Vanilla defaults: Short-term £10, Long-term £200.
-        // Short-term is per-hour; long-term is per-day (divided by 24 in-game).
+        // Car parking fees. Vanilla: Short-term £10/hr, Long-term £200/day.
         public static ConfigEntry<float> ShortTermParkingIncome;
         public static ConfigEntry<float> LongTermParkingIncome;
 
-        // Aviation fuel prices — charged to airlines per litre dispensed.
-        // Vanilla defaults: Avgas 100LL £2.00/litre, Jet A1 £0.50/litre.
+        // Aviation fuel prices. Vanilla: Avgas 100LL £2.00/L, Jet A1 £0.50/L.
         public static ConfigEntry<float> Avgas100LLIncome;
         public static ConfigEntry<float> JetA1Income;
 
-        // -------------------------------------------------------------------------
-        // Runtime state flags.
-        //
-        // BaseFeeCacheInitialized — set true after EnsureBaseFeeCacheInitialized()
-        //   runs successfully.  Guards all multiplier application calls so they
-        //   never execute before vanilla values have been captured.  Also guards
-        //   FeesPanelDisplayPatch so LoadPanel calls that arrive before the cache
-        //   is ready during session load are silently skipped.
-        //
-        // IsSyncingFeesPanelDisplay — set true inside ApplyB2FeesPanelOverrides()
-        //   while slider values are being written programmatically.  Acts as a
-        //   secondary guard for our own OnValueChanged listeners in addition to
-        //   the direct-write strategy.
-        // -------------------------------------------------------------------------
+        // BaseFeeCacheInitialized — guards multiplier application until vanilla values are captured.
+        // IsSyncingFeesPanelDisplay — suppresses our own OnValueChanged listeners during programmatic writes.
         public static bool BaseFeeCacheInitialized;
         public static bool IsSyncingFeesPanelDisplay;
 
-        // -------------------------------------------------------------------------
-        // Base fee cache.
-        //
-        // Seeded once per session from EconomyData vanilla defaults at load or new
-        // game.  These values are the permanent vanilla reference — they are never
-        // written to by slider interaction, save/load, or multiplier application.
-        //
-        // All vanilla fee defaults equal EconomyData.FeeMax / 2 (confirmed from
-        // decompiled EconomyData.cs).  The cache stores the default, not the max,
-        // because ApplyEconomyFeeMultipliers() computes:
-        //   scaledFee = baseFee × multiplier
-        // At multiplier 1.0 this reproduces exactly the vanilla default.
-        // -------------------------------------------------------------------------
+        // Base fee cache — vanilla defaults (FeeMax/2) seeded once per session.
+        // Never modified by sliders, save/load, or multiplier writes.
         public static float BaseSmallAircraftRunwayFee;
         public static float BaseMediumAircraftRunwayFee;
         public static float BaseLargeAircraftRunwayFee;
@@ -358,39 +186,24 @@ namespace ACEO_KTL_Economy_Tweaks
 
         internal static new ManualLogSource Logger;
 
-        // _isNormalizingConfig — re-entrancy guard for NormalizeAndSaveConfigValues()
-        // and the live SettingChanged handlers.  Prevents a config write triggered
-        // by snapping from re-entering the snap logic recursively.
-        private bool _isNormalizingConfig;
+        private bool _isNormalizingConfig; // re-entrancy guard for config snap handlers
+        private static readonly HashSet<int> HookedFeesPanelInstanceIds = new HashSet<int>(); // prevents duplicate listener attachment on scene reload
+        public static readonly HashSet<int> InjectedFeesPanelInstanceIds = new HashSet<int>(); // prevents duplicate stand slider injection per panel instance
 
-        // HookedFeesPanelInstanceIds — tracks which FeesPanelUI instances have
-        // already had our OnValueChanged listeners attached.  FeesPanelUI can be
-        // instantiated more than once in a session (e.g. after scene reload), so
-        // we check the Unity instance ID before attaching to avoid duplicate hooks.
-        private static readonly HashSet<int> HookedFeesPanelInstanceIds = new HashSet<int>();
-
-        // -------------------------------------------------------------------------
-        // Slider table.
-        //
-        // Each SliderDef maps one in-game Fees panel slider to its vanilla min/max,
-        // display step, and the multiplier getter for its fee category.
-        //
-        // VanillaMin / VanillaMax values from decompiled FeesPanelUI.cs and
-        // EconomyData.cs (FeeMin / FeeMax constants):
-        //   Small Runway    £100 / £1,000   Medium Runway    £500 / £3,000
-        //   Large Runway  £1,000 / £5,000   Small Stand       £50 /   £800
-        //   Hangar Repair   £100 / £1,200
-        //   Avgas 100LL   £0.50 /    £4/L   Jet A1          £0.10 /    £1/L
-        //   Catering Meal  £1.0 /   £10/m   Cabin Cleaning  £0.50 /    £5/ac
-        //   De-icing       £2.0 /   £20/L
-        //   Passenger Hdl    £5 /     £30   Baggage Hdl        £3 /     £20
-        //   Short Parking    £2 /     £20   Long Parking      £50 /    £400
-        //
-        // Medium and large stand sliders do not exist in vanilla FeesPanelUI and
-        // are therefore absent from this table.  Their fees are still scaled by
-        // ApplyEconomyFeeMultipliers() — they just cannot be dragged manually.
-        // -------------------------------------------------------------------------
+        // Slider table — maps each Fees panel slider to vanilla min/max, step, and multiplier getter.
+        // VanillaMin/Max from FeesPanelUI.cs and EconomyData.cs (FeeMin/FeeMax constants):
+        //   Small Runway £100/£1,000  Medium Runway £500/£3,000  Large Runway £1,000/£5,000
+        //   Small/GA Stand £50/£800  Medium Stand £100/£1,000  Large Stand £100/£1,200
+        //   Hangar Repair £100/£1,200
+        //   Avgas 100LL £0.50/£4/L  Jet A1 £0.10/£1/L  Catering £1/£10/m  Cabin Cleaning £0.50/£5
+        //   De-icing £2/£20/L  Passenger Hdl £5/£30  Baggage Hdl £3/£20
+        //   Short Parking £2/£20  Long Parking £50/£400
+        // Medium/large stand sliders are injected at runtime; their GameObjects are clones
+        // of SmallStandParkingFee parented to AircraftStandUsage.
         private static SliderDef[] _sliderTable;
+
+        // Tracks injected stand slider GameObjects so they can be destroyed on session reset.
+        private static readonly List<GameObject> _injectedStandSliders = new List<GameObject>();
 
         private static void BuildSliderTable()
         {
@@ -401,6 +214,8 @@ namespace ACEO_KTL_Economy_Tweaks
                 new SliderDef("mediumAircraftRunwaySlider",         500f,  3000f,   50f,   () => GetRunwayStandValue(MediumRunwayIncome)),
                 new SliderDef("largeAircraftRunwaySlider",         1000f,  5000f,  100f,   () => GetRunwayStandValue(LargeRunwayIncome)),
                 new SliderDef("smallStandParkingSlider",             50f,   800f,   10f,   () => GetRunwayStandValue(SmallStandIncome)),
+                new SliderDef("mediumStandParkingSlider",           100f,  1000f,   50f,   () => GetRunwayStandValue(MediumStandIncome)),
+                new SliderDef("largeStandParkingSlider",            100f,  1200f,   50f,   () => GetRunwayStandValue(LargeStandIncome)),
                 new SliderDef("hangarAircraftRepairSlider",         100f,  1200f,   20f,   () => GetServiceValue(HangarRepairIncome)),
                 new SliderDef("aviationFuelAvgas100LLSlider",       0.5f,    4f,   0.1f,  () => GetAvgasValue(Avgas100LLIncome)),
                 new SliderDef("aviationFuelJetA1Slider",            0.1f,    1f,   0.1f,  () => GetJetA1Value(JetA1Income)),
@@ -414,16 +229,6 @@ namespace ACEO_KTL_Economy_Tweaks
             };
         }
 
-        // -------------------------------------------------------------------------
-        // Awake
-        //
-        // Standard BepInEx entry point.  Config is bound before the slider table is
-        // built because SliderDef delegates capture the config entries by reference.
-        // NormalizeAndSaveConfigValues() snaps any out-of-step values that may have
-        // been hand-edited in the .cfg file before the game reads them.
-        // Each harmony.PatchAll() call is intentionally separate so that a single
-        // patch failure does not silently prevent the remaining patches from loading.
-        // -------------------------------------------------------------------------
         void Awake()
         {
             Logger = base.Logger;
@@ -439,48 +244,28 @@ namespace ACEO_KTL_Economy_Tweaks
             harmony.PatchAll(typeof(FeesPanelDisplayPatch));
             harmony.PatchAll(typeof(AirportRatingManagerInitCurvesPatch));
 
-            Logger.LogInfo("KTL Economy Tweaks 1.1.2 loaded.");
+            Logger.LogInfo("KTL Economy Tweaks 1.2.4 loaded.");
         }
 
-        // -------------------------------------------------------------------------
-        // Start
-        //
-        // Watermark registration runs in Start rather than Awake because
-        // WatermarkUtils requires other singletons to be present, which are not
-        // guaranteed during Awake.
-        //
-        // EventDispatcher hooks reset the base fee cache on load and new game so
-        // vanilla defaults are always re-read cleanly at the start of each session.
-        // This is necessary because EconomyData is re-created from saved JSON on
-        // load — any previously applied multipliers embedded in the save would be
-        // re-read as the new "base", compounding on subsequent multiplier writes.
-        // Resetting the cache and re-seeding from vanilla prevents this.
-        // -------------------------------------------------------------------------
+        // Start: registers watermark and event hooks for save load / new game
+        // to re-seed the base cache from fresh EconomyData each session.
         void Start()
         {
-            WatermarkUtils.Register(new WatermarkInfo("KTL-ET", "1.1.2", true));
+            WatermarkUtils.Register(new WatermarkInfo("KTL-ET", "1.2.4", true));
 
             EventDispatcher.EndOfLoad += OnSaveLoaded;
             EventDispatcher.NewGameStarted += OnNewGame;
         }
 
-        // =========================================================================
-        // Session lifecycle
-        //
-        // Both handlers follow the same pattern:
-        //   1. Invalidate the base cache so EnsureBaseFeeCacheInitialized() will
-        //      re-seed from the freshly loaded EconomyData.
-        //   2. Clear the hooked panel set so listeners are re-attached to new
-        //      FeesPanelUI instances created for the new session.
-        //   3. Reset the per-slider multiplier cache so the first tick re-establishes
-        //      the midpoint from the fresh base, not from a prior session's value.
-        //   4. Seed the cache and apply multipliers immediately so fee values are
-        //      correct before the first hourly tick fires.
-        // =========================================================================
+        // Session lifecycle: invalidate cache, clear hooked panel set, destroy any
+        // injected stand slider GameObjects, reset slider multiplier cache, then
+        // re-seed and apply multipliers immediately.
         private static void OnSaveLoaded(SaveLoadGameDataController _)
         {
             BaseFeeCacheInitialized = false;
             HookedFeesPanelInstanceIds.Clear();
+            InjectedFeesPanelInstanceIds.Clear();
+            DestroyInjectedSliders();
             ResetSliderMultiplierCache();
 
             EconomyData data = GetEconomyData();
@@ -495,6 +280,8 @@ namespace ACEO_KTL_Economy_Tweaks
         {
             BaseFeeCacheInitialized = false;
             HookedFeesPanelInstanceIds.Clear();
+            InjectedFeesPanelInstanceIds.Clear();
+            DestroyInjectedSliders();
             ResetSliderMultiplierCache();
 
             EconomyData data = GetEconomyData();
@@ -506,19 +293,200 @@ namespace ACEO_KTL_Economy_Tweaks
             }
         }
 
-        // =========================================================================
-        // Base fee cache
-        //
-        // Seeds the static Base* fields from EconomyData vanilla Default properties.
-        // Called once per session — the BaseFeeCacheInitialized guard prevents any
-        // subsequent call (e.g. from a Fees panel open) from overwriting the clean
-        // vanilla values with already-multiplied ones.
-        //
-        // All vanilla defaults are FeeMax / 2 (confirmed from EconomyData.cs).
-        // Seeding from the Default property rather than the live field ensures we
-        // always capture the true vanilla value regardless of what has already been
-        // written to EconomyData by the time this is called.
-        // =========================================================================
+        // Destroys any previously injected stand slider GameObjects and clears the
+        // SliderDef.Slider references for the injected entries so they are re-injected
+        // fresh on the next panel open.
+        private static void DestroyInjectedSliders()
+        {
+            foreach (var go in _injectedStandSliders)
+                if (go != null) UnityEngine.Object.Destroy(go);
+            _injectedStandSliders.Clear();
+
+            // Null out cached Slider refs for the injected SliderDefs so ResolveSlider
+            // doesn't find stale references after the GameObjects are destroyed.
+            if (_sliderTable == null) return;
+            foreach (var def in _sliderTable)
+            {
+                if (def.FieldName == "mediumStandParkingSlider" || def.FieldName == "largeStandParkingSlider")
+                    def.Slider = null;
+            }
+        }
+
+        // InjectStandSliders — clones SmallStandParkingFee twice into AircraftStandUsage,
+        // renames the SliderDescription label child, seeds the initial value from live
+        // EconomyData, and stores the ValueSliderContainerUI reference directly onto the
+        // matching SliderDef entries in _sliderTable.
+        // Called once per panel instance from FeesPanelInitPatch via the hooked instance guard.
+        // Injected GameObjects are tracked in _injectedStandSliders for session-reset cleanup.
+        public static void InjectStandSliders(FeesPanelUI feesPanel)
+        {
+            Transform standUsage = feesPanel.transform.Find("AircraftStandUsage");
+            Transform sourceRow = feesPanel.transform.Find("AircraftStandUsage/SmallStandParkingFee");
+            if (standUsage == null || sourceRow == null)
+            {
+                Logger.LogWarning("[v1.2.4] AircraftStandUsage or SmallStandParkingFee not found — stand sliders not injected.");
+                return;
+            }
+
+            // DIAGNOSTIC — logs all direct children of SmallStandParkingFee and their
+            // component type names to identify the tooltip child and component type.
+            // To be removed once tooltip child/component are confirmed.
+            LogStandSliderChildren(sourceRow);
+
+            // Correct the source slider's label to "Small / GA".
+            // LocalizedTextMeshPro is disabled first to prevent it overwriting our text.
+            // This mod is English-only; localisation is not supported for injected labels.
+            Transform sourceDesc = sourceRow.Find("SliderDescription");
+            if (sourceDesc != null)
+            {
+                DisableLocalizedTextMeshPro(sourceDesc);
+
+                var srcUGUI = sourceDesc.GetComponent<TextMeshProUGUI>();
+                if (srcUGUI != null)
+                {
+                    srcUGUI.text = "Small / GA";
+                    srcUGUI.ForceMeshUpdate();
+                }
+                else
+                {
+                    var srcTmp = sourceDesc.GetComponent<TextMeshPro>();
+                    if (srcTmp != null)
+                    {
+                        srcTmp.text = "Small / GA";
+                        srcTmp.ForceMeshUpdate();
+                    }
+                }
+            }
+
+            EconomyData data = GetEconomyData();
+            InjectOneStandSlider(standUsage, sourceRow, "MediumStandParkingFee", "Medium aircraft", "mediumStandParkingSlider", data?.mediumStandParkingFee ?? 0f);
+            InjectOneStandSlider(standUsage, sourceRow, "LargeStandParkingFee", "Large aircraft", "largeStandParkingSlider", data?.largeStandParkingFee ?? 0f);
+        }
+
+        private static void InjectOneStandSlider(Transform parent, Transform source, string goName, string label, string sliderDefName, float seedValue)
+        {
+            // Clone source row, rename, and parent to AircraftStandUsage.
+            GameObject clone = UnityEngine.Object.Instantiate(source.gameObject, parent);
+            clone.name = goName;
+            _injectedStandSliders.Add(clone);
+
+            // Rewrite the label text via the SliderDescription child.
+            // LocalizedTextMeshPro is disabled first to prevent it overwriting our text.
+            // This mod is English-only; localisation is not supported for injected labels.
+            // The component may be TextMeshProUGUI (canvas) or TextMeshPro (world); try both.
+            Transform desc = clone.transform.Find("SliderDescription");
+            if (desc != null)
+            {
+                DisableLocalizedTextMeshPro(desc);
+
+                var tmpUGUI = desc.GetComponent<TextMeshProUGUI>();
+                if (tmpUGUI != null)
+                {
+                    tmpUGUI.text = label;
+                    tmpUGUI.ForceMeshUpdate();
+                }
+                else
+                {
+                    var tmp = desc.GetComponent<TextMeshPro>();
+                    if (tmp != null)
+                    {
+                        tmp.text = label;
+                        tmp.ForceMeshUpdate();
+                    }
+                    else Logger.LogWarning($"[v1.2.4] No TMP component found on SliderDescription of cloned {goName}.");
+                }
+            }
+            else
+            {
+                Logger.LogWarning($"[v1.2.4] SliderDescription not found on cloned {goName}.");
+            }
+
+            // Store the ValueSliderContainerUI reference directly on the matching SliderDef.
+            // SliderDef.ResolveSlider() uses reflection on FeesPanelUI fields, which won't
+            // find injected GOs — so we assign the component reference manually here instead.
+            var vsc = clone.GetComponent<ValueSliderContainerUI>();
+            if (vsc == null)
+            {
+                Logger.LogWarning($"[v1.2.4] ValueSliderContainerUI not found on cloned {goName}.");
+                return;
+            }
+
+            // Find the matching SliderDef, assign the wrapper reference, and mark as injected.
+            // IsInjected prevents ResolveSlider from later nulling this reference via reflection.
+            SliderDef matchedDef = null;
+            foreach (var def in _sliderTable)
+            {
+                if (def.FieldName == sliderDefName)
+                {
+                    def.Slider = vsc;
+                    def.IsInjected = true;
+                    matchedDef = def;
+                    break;
+                }
+            }
+
+            if (matchedDef == null) return;
+
+            // Seed the inner Unity Slider with the correct min/max/value from EconomyData
+            // so it opens at the right position rather than inheriting the clone source value.
+            // ApplyB2FeesPanelOverrides will re-apply these after injection, but seeding here
+            // ensures the slider is correct even before that call completes.
+            FieldInfo innerField = AccessTools.Field(typeof(ValueSliderContainerUI), "slider");
+            var inner = innerField?.GetValue(vsc) as Slider;
+            if (inner != null)
+            {
+                float multiplier = matchedDef.GetMultiplier();
+                float displayMin = matchedDef.VanillaMin * multiplier;
+                float displayMax = Mathf.Max(displayMin + 0.001f, matchedDef.VanillaMax * multiplier);
+                float clampedSeed = Mathf.Clamp(seedValue, displayMin, displayMax);
+
+                inner.minValue = displayMin;
+                inner.maxValue = displayMax;
+                inner.value = clampedSeed;
+                vsc.roundValue = matchedDef.DisplayStep * multiplier;
+                vsc.UpdateContainer();
+
+                Logger.LogInfo($"[v1.2.4] Injected {goName}: label='{label}' min={displayMin} max={displayMax} value={clampedSeed}");
+            }
+            else
+            {
+                Logger.LogWarning($"[v1.2.4] Inner Slider not found on cloned {goName} — value not seeded.");
+            }
+        }
+
+        // Disables the LocalizedTextMeshPro component on a SliderDescription transform if present.
+        // That component overwrites TMP text with the vanilla localised string after every write.
+        // Injected stand slider labels are English-only and do not use localisation.
+        private static void DisableLocalizedTextMeshPro(Transform descTransform)
+        {
+            foreach (var c in descTransform.GetComponents<Behaviour>())
+            {
+                if (c.GetType().Name == "LocalizedTextMeshPro")
+                {
+                    c.enabled = false;
+                    return;
+                }
+            }
+        }
+
+        // DIAGNOSTIC — logs all direct children of SmallStandParkingFee and their
+        // component type names. Fires once at injection time to identify the tooltip
+        // child name and component type. Remove once confirmed.
+        private static void LogStandSliderChildren(Transform sourceRow)
+        {
+            Logger.LogInfo($"[DIAG] SmallStandParkingFee children ({sourceRow.childCount}):");
+            for (int i = 0; i < sourceRow.childCount; i++)
+            {
+                Transform child = sourceRow.GetChild(i);
+                var componentNames = new System.Text.StringBuilder();
+                foreach (var c in child.GetComponents<Component>())
+                    componentNames.Append(c.GetType().Name).Append(", ");
+                Logger.LogInfo($"[DIAG]   [{i}] '{child.name}' — {componentNames}");
+            }
+        }
+
+        // Seeds Base* fields from EconomyData Default properties. Called once per session;
+        // guard prevents overwriting clean vanilla values with already-multiplied ones.
         public static void EnsureBaseFeeCacheInitialized(EconomyData data)
         {
             if (BaseFeeCacheInitialized || data == null) return;
@@ -544,17 +512,8 @@ namespace ACEO_KTL_Economy_Tweaks
             Logger.LogInfo("Base fee cache initialised from vanilla defaults.");
         }
 
-        // =========================================================================
-        // Config binding
-        //
-        // All entries use AcceptableValueRange so BepInEx enforces bounds both in
-        // the config manager UI and when loading hand-edited .cfg files.
-        // NormalizeAndSaveConfigValues() additionally snaps values to the defined
-        // step grid, which AcceptableValueRange alone does not enforce.
-        //
-        // Section numbers match the in-game Fees panel layout order so the
-        // BepInEx config manager presents categories in a familiar sequence.
-        // =========================================================================
+        // Config binding — AcceptableValueRange enforces bounds; NormalizeAndSaveConfigValues
+        // additionally snaps to step grid. Section numbers match the Fees panel layout order.
         private void BindConfig()
         {
             EnableEconomy = BindBool("1. Enable", "EnableEconomy", true, "Master toggle for all economy fee multipliers.");
@@ -564,8 +523,8 @@ namespace ACEO_KTL_Economy_Tweaks
             LargeRunwayIncome = BindFloat("2. Runways", "LargeRunwayIncome", 1f, 0.5f, 2.5f, "Large aircraft runway fee multiplier. 1.0 = vanilla. Low: 0.5 (£500 min, £2,500 max). High: 2.5 (£2,500 min, £12,500 max). Step: 10%.");
 
             SmallStandIncome = BindFloat("3. Stands", "SmallStandIncome", 1f, 0.5f, 2.5f, "Small/GA stand parking fee multiplier. 1.0 = vanilla. Low: 0.5 (£25 min, £400 max). High: 2.5 (£125 min, £2,000 max). Step: 10%.");
-            MediumStandIncome = BindFloat("3. Stands", "MediumStandIncome", 1f, 0.5f, 2.5f, "Medium stand parking fee multiplier. 1.0 = vanilla. No slider — applied directly. Step: 10%.");
-            LargeStandIncome = BindFloat("3. Stands", "LargeStandIncome", 1f, 0.5f, 2.5f, "Large stand parking fee multiplier. 1.0 = vanilla. No slider — applied directly. Step: 10%.");
+            MediumStandIncome = BindFloat("3. Stands", "MediumStandIncome", 1f, 0.5f, 2.5f, "Medium stand parking fee multiplier. 1.0 = vanilla. Low: 0.5 (£50 min, £500 max). High: 2.5 (£250 min, £2,500 max). Step: 10%.");
+            LargeStandIncome = BindFloat("3. Stands", "LargeStandIncome", 1f, 0.5f, 2.5f, "Large stand parking fee multiplier. 1.0 = vanilla. Low: 0.5 (£50 min, £600 max). High: 2.5 (£250 min, £3,000 max). Step: 10%.");
 
             HangarRepairIncome = BindFloat("4. Aircraft Services", "HangarRepairIncome", 1f, 0.5f, 1.5f, "Hangar repair fee multiplier. 1.0 = vanilla. Low: 0.5 (£50 min, £600 max). High: 1.5 (£150 min, £1,800 max). Step: 10%.");
             CabinCleaningIncome = BindFloat("4. Aircraft Services", "CabinCleaningIncome", 1f, 0.5f, 1.5f, "Cabin cleaning fee multiplier. 1.0 = vanilla. Low: 0.5 (£0.25 min, £2.50 max). High: 1.5 (£0.75 min, £7.50 max). Step: 10%.");
@@ -588,27 +547,10 @@ namespace ACEO_KTL_Economy_Tweaks
         private ConfigEntry<float> BindFloat(string section, string key, float def, float min, float max, string desc) =>
             Config.Bind(section, key, def, new ConfigDescription(desc, new AcceptableValueRange<float>(min, max)));
 
-        // =========================================================================
-        // Step-snapping helpers
-        //
-        // BepInEx AcceptableValueRange enforces min/max but does not snap values to
-        // a step grid.  These helpers clamp and snap to the defined step so that:
-        //   - Hand-edited .cfg values are rounded to the nearest valid step on load.
-        //   - Live slider drags in the config manager snap cleanly without drift.
-        //
-        // Each fee category has its own helper because they have different ranges
-        // and steps.  The helpers are public so patch classes can call them directly
-        // without needing to re-implement the clamping logic.
-        //
-        // Vanilla fee ranges and steps (for reference):
-        //   Runways / Stands   : 0.5–2.5,  10% steps  — broad range, primary income
-        //   Aircraft Services  : 0.5–1.5,  10% steps  — per-aircraft, tighter band
-        //   Handling           : 0.5–1.75,  5% steps  — per-passenger, fine control
-        //   Short-term Parking : 0.5–1.5,  10% steps  — passenger price-sensitive
-        //   Long-term Parking  : 0.5–2.0,  10% steps  — wider ceiling, less elastic
-        //   Avgas 100LL        : 0.5–2.5,   5% steps  — GA fuel, niche revenue
-        //   Jet A1             : 0.5–2.0,   5% steps  — airline fuel, high elasticity
-        // =========================================================================
+        // Step-snapping helpers — clamp and round config values to valid step grids.
+        // Ranges: Runways/Stands 0.5–2.5 (10%), Services 0.5–1.5 (10%),
+        //   Handling 0.5–1.75 (5%), Short Parking 0.5–1.5 (10%),
+        //   Long Parking 0.5–2.0 (10%), Avgas 0.5–2.5 (5%), Jet A1 0.5–2.0 (5%).
         public static float SnapToStep(float value, float min, float max, float step)
         {
             float clamped = Mathf.Clamp(value, min, max);
@@ -659,17 +601,6 @@ namespace ACEO_KTL_Economy_Tweaks
             }
         }
 
-        // =========================================================================
-        // Live config change handlers
-        //
-        // Registered via SettingChanged so that adjusting a multiplier in the
-        // BepInEx config manager mid-game snaps the new value to the step grid and
-        // saves immediately, without requiring a game restart or manual .cfg edit.
-        //
-        // _isNormalizingConfig guards against re-entrancy: writing entry.Value
-        // inside the handler fires SettingChanged again, which would loop.  The
-        // flag is set before the write and cleared in the finally block.
-        // =========================================================================
         public void RegisterLiveConfigHandlers()
         {
             RegisterSnapHandler(SmallRunwayIncome, e => GetRunwayStandValue(e));
@@ -701,59 +632,21 @@ namespace ACEO_KTL_Economy_Tweaks
             };
         }
 
-        // =========================================================================
-        // Fee application
-        //
-        // Target: EconomyData fields (written directly, not via patch).
-        //
-        // Vanilla: EconomyData fields are written once at construction from their
-        //   Default properties (FeeMax / 2), and subsequently updated when the
-        //   player drags a Fees panel slider.  No multiplier exists in vanilla.
-        //
-        // Mod: Non-slider fees (medium and large stand parking) are always written
-        //   as base × snapped multiplier — no player drag path exists for them.
-        //
-        //   Slider-mapped fees are written conditionally via
-        //   ApplySliderFeeIfMultiplierChanged().  Each SliderDef caches the
-        //   multiplier value that was active when its fee was last written here.
-        //   On each call the current snapped multiplier is compared against that
-        //   cache.  If they match, the player's dragged EconomyData value is left
-        //   untouched.  If they differ, the fee resets to base × multiplier, the
-        //   cache is updated, and the slider will reposition to the new midpoint on
-        //   the next panel open via ApplyB2FeesPanelOverrides().
-        //
-        // RefreshAirportRatingEvaluationCurves() is called at the end of every
-        // application so rating curves always reflect the current live fee values.
-        // =========================================================================
+        // ApplyEconomyFeeMultipliers — writes scaledFee = base × multiplier to EconomyData.
+        // All fees are now slider-mapped; only rewrite when multiplier has changed since last write.
         public static void ApplyEconomyFeeMultipliers(EconomyData data, string callerContext = "unknown")
         {
             if (!EnableEconomy.Value || data == null) return;
             if (!BaseFeeCacheInitialized) return;
 
-            // -----------------------------------------------------------------------
-            // Non-slider fees — always apply; no player drag path exists for these.
-            // -----------------------------------------------------------------------
-            data.mediumStandParkingFee = Round(BaseMediumStandParkingFee * GetRunwayStandValue(MediumStandIncome), 50f);
-            data.largeStandParkingFee = Round(BaseLargeStandParkingFee * GetRunwayStandValue(LargeStandIncome), 50f);
-
-            // -----------------------------------------------------------------------
-            // Slider-mapped fees — only overwrite when the multiplier has changed
-            // since the last write.  Player drag values persist when it has not.
-            // -----------------------------------------------------------------------
+            // All stand fees now have sliders — handled by ApplySliderFeeIfMultiplierChanged.
             ApplySliderFeeIfMultiplierChanged(data);
 
             RefreshAirportRatingEvaluationCurves();
         }
 
-        // =========================================================================
-        // ApplySliderFeeIfMultiplierChanged
-        //
-        // Iterates the slider table.  For each entry, compares the current snapped
-        // multiplier against SliderDef.LastAppliedMultiplier.  Writes
-        // base × multiplier to EconomyData only when they differ, then updates the
-        // cache.  When they match, the player's dragged value in EconomyData is
-        // preserved untouched.
-        // =========================================================================
+        // Writes base × multiplier per slider only when the multiplier has changed;
+        // player-dragged EconomyData values are preserved when it has not.
         private static void ApplySliderFeeIfMultiplierChanged(EconomyData data)
         {
             foreach (var def in _sliderTable)
@@ -779,6 +672,8 @@ namespace ACEO_KTL_Economy_Tweaks
                 case "mediumAircraftRunwaySlider": return BaseMediumAircraftRunwayFee;
                 case "largeAircraftRunwaySlider": return BaseLargeAircraftRunwayFee;
                 case "smallStandParkingSlider": return BaseSmallStandParkingFee;
+                case "mediumStandParkingSlider": return BaseMediumStandParkingFee;
+                case "largeStandParkingSlider": return BaseLargeStandParkingFee;
                 case "hangarAircraftRepairSlider": return BaseHangarAircraftRepairFee;
                 case "aviationFuelAvgas100LLSlider": return BaseAvgas100LLFuelCost;
                 case "aviationFuelJetA1Slider": return BaseJetA1FuelCost;
@@ -793,9 +688,7 @@ namespace ACEO_KTL_Economy_Tweaks
             }
         }
 
-        // Returns the Round() step for a slider by field name.
-        // Steps match vanilla slider snap increments and the existing
-        // ApplyEconomyFeeMultipliers() rounding conventions.
+        // Returns the rounding step for a slider by field name (matches vanilla snap increments).
         private static float GetRoundStepForSlider(string fieldName)
         {
             switch (fieldName)
@@ -804,6 +697,8 @@ namespace ACEO_KTL_Economy_Tweaks
                 case "mediumAircraftRunwaySlider":
                 case "largeAircraftRunwaySlider": return 100f;
                 case "smallStandParkingSlider":
+                case "mediumStandParkingSlider":
+                case "largeStandParkingSlider":
                 case "hangarAircraftRepairSlider": return 50f;
                 case "passengerHandlingSlider":
                 case "baggageHandlingSlider":
@@ -818,14 +713,8 @@ namespace ACEO_KTL_Economy_Tweaks
             }
         }
 
-        // =========================================================================
-        // ResetSliderMultiplierCache
-        //
-        // Resets each slider's LastAppliedMultiplier to -1f.  Called on session
-        // load and new game so the next ApplyEconomyFeeMultipliers() call always
-        // re-establishes the midpoint from the fresh base cache rather than
-        // carrying forward a cached value from a prior session.
-        // =========================================================================
+        // Resets each slider's LastAppliedMultiplier to -1f on session boundaries
+        // so the next apply call always re-establishes from the fresh base cache.
         private static void ResetSliderMultiplierCache()
         {
             if (_sliderTable == null) return;
@@ -833,40 +722,11 @@ namespace ACEO_KTL_Economy_Tweaks
                 def.LastAppliedMultiplier = -1f;
         }
 
-        // =========================================================================
-        // Rating curve refresh
-        //
-        // Target: AirportRatingManager private AnimationCurve fields (written via
-        //   AccessTools reflection — same approach used by vanilla's own
-        //   InitializeEvaluationCurves() which is private and inaccessible directly).
-        //
-        // Vanilla: AirportRatingManager.InitializeEvaluationCurves() builds each
-        //   curve once at startup using the hardcoded FeeMax constant as the x-axis
-        //   anchor:  EaseInOut(FeeMax × 0.4, 1f,  FeeMax × 1.0, 0f)
-        //   meaning: at 40% of FeeMax the rating is 1 (fully happy/green);
-        //            at 100% of FeeMax the rating is 0 (fully unhappy/red).
-        //   Since all vanilla fee defaults are FeeMax / 2, the default fee sits at
-        //   the midpoint of the green zone — correct and intentional vanilla design.
-        //
-        // Problem without this mod: applying a 2× multiplier doubles the live fee
-        //   but leaves the curve anchored at the original FeeMax.  The doubled fee
-        //   now evaluates to a point well into the orange/red zone even though from
-        //   the player's perspective it is the new "normal" price.
-        //
-        // Mod fix: rebuild each curve using BuildCurve(baseFee, multiplier), which
-        //   reconstructs a scaled FeeMax as baseFee × 2 × multiplier and applies
-        //   the same 0.4×/1.0× thresholds vanilla uses.  At multiplier 1.0 the
-        //   result is bit-identical to what vanilla initialises.  At any other
-        //   multiplier the green zone shifts proportionally so the default position
-        //   of the scaled fee always reads green in both the Fees panel and the
-        //   lower-UI report bars.
-        //
-        // Called after every ApplyEconomyFeeMultipliers() and after every in-game
-        // slider drag so curves stay in sync with live fee values at all times.
-        // Also patched onto AirportRatingManager.InitializeEvaluationCurves() via
-        // AirportRatingManagerInitCurvesPatch so our curves replace the vanilla ones
-        // at scene load before any rating evaluations run.
-        // =========================================================================
+        // Rebuilds all rating AnimationCurve fields on AirportRatingManager via reflection,
+        // scaling each curve's x-axis anchor by the active multiplier so that green/orange/red
+        // bands in the Fees panel and report bars always reflect the current scaled fee range.
+        // Called after every fee application and slider drag; also patched onto
+        // InitializeEvaluationCurves() so our curves replace vanilla ones at scene load.
         public static void RefreshAirportRatingEvaluationCurves()
         {
             var rm = Singleton<AirportRatingManager>.Instance;
@@ -927,36 +787,15 @@ namespace ACEO_KTL_Economy_Tweaks
             return AnimationCurve.EaseInOut(scaledFeeMax * 0.4f, 1f, scaledFeeMax, 0f);
         }
 
-        // =========================================================================
-        // Fees panel integration
-        //
-        // Vanilla FeesPanelUI manages its own slider display independently of the
-        // EconomyData multiplier system.  Three points of intervention are needed:
-        //
-        //   1. InitializePanel (FeesPanelInitPatch) — called once when the panel
-        //      is first created.  We seed the base cache, apply multipliers to
-        //      EconomyData, attach our OnValueChanged listeners, then immediately
-        //      call ApplyB2FeesPanelOverrides() so slider ranges are correct before
-        //      the player can interact with them.
-        //
-        //   2. LoadPanel (FeesPanelDisplayPatch) — called each time the player
-        //      opens the Fees UI.  Vanilla reads slider values from EconomyData
-        //      and sets MaxValue from the hardcoded FeeMax constants, which are
-        //      unaware of our multiplier.  ApplyB2FeesPanelOverrides() corrects
-        //      the slider min, max, step and value after vanilla's load runs.
-        //      Guarded on BaseFeeCacheInitialized — calls that arrive before the
-        //      cache is ready during session load are silently skipped.
-        //
-        //   3. OnValueChanged listeners (attached in AttachB2FeesPanelListeners)
-        //      — fire when the player drags a slider.  The raw value is snapped to
-        //      the mod's displayStep grid before being written to EconomyData, so
-        //      the value is always on a clean boundary that vanilla's internal snap
-        //      cannot re-snap to a different position.
-        //
-        // Note: medium and large stand sliders do not exist in vanilla FeesPanelUI
-        // so they cannot be dragged manually.  Their fees are still scaled by
-        // ApplyEconomyFeeMultipliers() on every hourly tick.
-        // =========================================================================
+        // Fees panel integration — three patch points:
+        //   InitializePanel (FeesPanelInitPatch): seed cache, apply multipliers,
+        //     attach listeners, call ApplyB2FeesPanelOverrides so ranges are set
+        //     before the player can interact.
+        //   LoadPanel (FeesPanelDisplayPatch): correct slider min/max/step/value
+        //     after vanilla sets them from hardcoded FeeMax constants. Guarded on
+        //     BaseFeeCacheInitialized.
+        //   OnValueChanged listeners (AttachB2FeesPanelListeners): snap raw drag
+        //     to mod's displayStep grid before writing to EconomyData.
         public static EconomyData GetEconomyData() =>
             Singleton<EconomyController>.Instance?.economyData;
 
@@ -981,11 +820,7 @@ namespace ACEO_KTL_Economy_Tweaks
                     EconomyData data = GetEconomyData();
                     if (data == null) return;
 
-                    // Snap the raw drag value to the nearest displayStep multiple
-                    // before writing to EconomyData.  This ensures the value is on
-                    // the mod's step grid so the subsequent ApplyB2FeesPanelOverrides()
-                    // write lands on the same value and vanilla's internal round step
-                    // has nothing to re-snap to a different position.
+                    // Snap drag to displayStep grid so it lands cleanly and vanilla can't re-snap it.
                     float multiplier = capturedDef.GetMultiplier();
                     float step = capturedDef.DisplayStep * multiplier;
                     float snapped = step > 0f ? Mathf.Round(value / step) * step : value;
@@ -997,9 +832,7 @@ namespace ACEO_KTL_Economy_Tweaks
             }
         }
 
-        // Maps a slider field name to its corresponding EconomyData field and writes
-        // the given value.  Only fields that have an in-game slider are listed here;
-        // medium and large stand fees are absent because no slider exists for them.
+        // Maps a slider field name to its corresponding EconomyData field and writes the given value.
         private static void SetLiveEconomyValue(string fieldName, float value, EconomyData data)
         {
             switch (fieldName)
@@ -1008,6 +841,8 @@ namespace ACEO_KTL_Economy_Tweaks
                 case "mediumAircraftRunwaySlider": data.mediumAircraftRunwayFee = value; break;
                 case "largeAircraftRunwaySlider": data.largeAircraftRunwayFee = value; break;
                 case "smallStandParkingSlider": data.smallStandParkingFee = value; break;
+                case "mediumStandParkingSlider": data.mediumStandParkingFee = value; break;
+                case "largeStandParkingSlider": data.largeStandParkingFee = value; break;
                 case "hangarAircraftRepairSlider": data.hangarAircraftRepairFee = value; break;
                 case "aviationFuelAvgas100LLSlider": data.avgas100LLFuelCost = value; break;
                 case "aviationFuelJetA1Slider": data.jetA1FuelCost = value; break;
@@ -1021,27 +856,11 @@ namespace ACEO_KTL_Economy_Tweaks
             }
         }
 
-        // =========================================================================
-        // ApplyB2FeesPanelOverrides
-        //
-        // Sets each slider's min, max, step, and value to reflect the current
-        // multiplier-scaled range and live EconomyData value.
-        //
-        // Write strategy (v1.1.0):
-        //   1. IsSyncingFeesPanelDisplay is set to suppress our own listeners.
-        //   2. All listeners are removed from each slider's onValueChanged event
-        //      to prevent vanilla's InitializePanel listener from writing back to
-        //      EconomyData during the programmatic update.
-        //   3. Values are written directly to the inner Unity Slider via reflection,
-        //      bypassing the ValueSliderContainerUI.Value property setter and the
-        //      internal Awake listener (RoundValueChanged + UpdateContainer).
-        //   4. UpdateContainer() is called on the wrapper to refresh the display text
-        //      and colour band without triggering the event chain.
-        //   5. All listeners are restored and IsSyncingFeesPanelDisplay is cleared.
-        //
-        // ApplyEconomyFeeMultipliers() is intentionally NOT called here — it sets the
-        // config-driven baseline and must not overwrite a value the player just chose.
-        // =========================================================================
+        // ApplyB2FeesPanelOverrides — sets each slider's min/max/step/value to the
+        // multiplier-scaled range and live EconomyData value. Writes directly to the
+        // inner Unity Slider via reflection, stripping and restoring all listeners to
+        // prevent vanilla writing back to EconomyData during the programmatic update.
+        // Does NOT call ApplyEconomyFeeMultipliers — must not overwrite a player drag.
         public static void ApplyB2FeesPanelOverrides(FeesPanelUI feesPanel, string callerContext = "unknown")
         {
             if (!EnableEconomy.Value || feesPanel == null) return;
@@ -1110,9 +929,8 @@ namespace ACEO_KTL_Economy_Tweaks
             finally { IsSyncingFeesPanelDisplay = false; }
         }
 
-        // Returns the current live value of a fee from EconomyData by slider field
-        // name.  Used by ApplyB2FeesPanelOverrides() to populate slider display
-        // values without needing direct EconomyData field references per entry.
+        // Returns the current live value of a fee from EconomyData by slider field name.
+        // Used by ApplyB2FeesPanelOverrides() to populate slider display values.
         private static float GetLiveEconomyValue(string fieldName, EconomyData data)
         {
             switch (fieldName)
@@ -1121,6 +939,8 @@ namespace ACEO_KTL_Economy_Tweaks
                 case "mediumAircraftRunwaySlider": return data.mediumAircraftRunwayFee;
                 case "largeAircraftRunwaySlider": return data.largeAircraftRunwayFee;
                 case "smallStandParkingSlider": return data.smallStandParkingFee;
+                case "mediumStandParkingSlider": return data.mediumStandParkingFee;
+                case "largeStandParkingSlider": return data.largeStandParkingFee;
                 case "hangarAircraftRepairSlider": return data.hangarAircraftRepairFee;
                 case "aviationFuelAvgas100LLSlider": return data.avgas100LLFuelCost;
                 case "aviationFuelJetA1Slider": return data.jetA1FuelCost;
@@ -1135,22 +955,14 @@ namespace ACEO_KTL_Economy_Tweaks
             }
         }
 
-        // =========================================================================
-        // Shared utilities
-        // =========================================================================
-
-        // Rounds a float to the nearest multiple of step, then trims floating-point
-        // noise to 3 decimal places.  Used to keep fee values clean in EconomyData
-        // and avoid values like £1,499.9999 appearing in the UI.
+        // Round to nearest step multiple, trimmed to 3dp to avoid float noise in the UI.
         private static float Round(float value, float step)
         {
             if (step <= 0f) return value;
             return (float)System.Math.Round(Mathf.Round(value / step) * step, 3);
         }
 
-        // Writes newValue to entry only if it differs meaningfully (beyond floating-
-        // point noise at 3dp).  Returns true if a write occurred so callers can
-        // batch-detect whether a Config.Save() is needed.
+        // Writes newValue to entry only if meaningfully different (3dp); returns true if written.
         private static bool SetIfDifferent(ConfigEntry<float> entry, float newValue)
         {
             float cur = (float)System.Math.Round(entry.Value, 3);
@@ -1165,21 +977,9 @@ namespace ACEO_KTL_Economy_Tweaks
     // Harmony patches
     // =========================================================================
 
-    // -------------------------------------------------------------------------
-    // EconomyFeeRefreshPatch
-    //
-    // Target: EconomyController.UpdateHourlyBalanceUI()
-    // Type:   Prefix
-    //
-    // Vanilla: UpdateHourlyBalanceUI() reads current EconomyData fee fields to
-    //   populate the economy summary panel.  It does not modify fee values.
-    //
-    // Mod: A Prefix runs ApplyEconomyFeeMultipliers() before the vanilla method
-    //   reads the fields.  From v1.1.1 this no longer overwrites player-dragged
-    //   values — slider-mapped fees are only rewritten when the active multiplier
-    //   has changed since the last write (see ApplySliderFeeIfMultiplierChanged).
-    //   Non-slider fees (medium/large stand) continue to apply unconditionally.
-    // -------------------------------------------------------------------------
+    // EconomyFeeRefreshPatch — Prefix on EconomyController.UpdateHourlyBalanceUI().
+    // Runs ApplyEconomyFeeMultipliers() before vanilla reads EconomyData fee fields.
+    // Player-dragged slider values are preserved unless the multiplier has changed.
     [HarmonyPatch(typeof(EconomyController), "UpdateHourlyBalanceUI")]
     public static class EconomyFeeRefreshPatch
     {
@@ -1191,25 +991,10 @@ namespace ACEO_KTL_Economy_Tweaks
         }
     }
 
-    // -------------------------------------------------------------------------
-    // FeesPanelInitPatch
-    //
-    // Target: FeesPanelUI.InitializePanel()
-    // Type:   Postfix
-    //
-    // Vanilla: InitializePanel() locates and caches private slider references,
-    //   registers OnValueChanged listeners that write slider values back to
-    //   EconomyData, and sets up the panel layout.  Called once when the panel
-    //   GameObject is first initialised.
-    //
-    // Mod: After vanilla initialisation completes, we seed the base fee cache
-    //   (if not already seeded), apply multipliers so EconomyData is correct,
-    //   attach our listeners, then immediately call ApplyB2FeesPanelOverrides()
-    //   so slider ranges are set before the player can interact with them.
-    //   Without this call a drag before the first LoadPanel would fire with the
-    //   slider at its uninitialised Unity default position (minValue = 1),
-    //   writing £1 to EconomyData.
-    // -------------------------------------------------------------------------
+    // FeesPanelInitPatch — Postfix on FeesPanelUI.InitializePanel().
+    // Seeds base cache, applies multipliers, injects stand sliders (once per instance),
+    // attaches listeners, then calls ApplyB2FeesPanelOverrides so slider ranges are
+    // correct before first interaction.
     [HarmonyPatch(typeof(FeesPanelUI), "InitializePanel")]
     public static class FeesPanelInitPatch
     {
@@ -1222,33 +1007,21 @@ namespace ACEO_KTL_Economy_Tweaks
 
             GrandMasterPlugin.EnsureBaseFeeCacheInitialized(data);
             GrandMasterPlugin.ApplyEconomyFeeMultipliers(data, "FeesPanelInitPatch");
+
+            // Inject medium/large stand sliders once per panel instance, before
+            // listener attachment so the cloned wrappers are present when listeners
+            // are added and when ApplyB2FeesPanelOverrides resolves SliderDefs.
+            if (GrandMasterPlugin.InjectedFeesPanelInstanceIds.Add(__instance.GetInstanceID()))
+                GrandMasterPlugin.InjectStandSliders(__instance);
+
             GrandMasterPlugin.AttachB2FeesPanelListeners(__instance);
             GrandMasterPlugin.ApplyB2FeesPanelOverrides(__instance, "FeesPanelInitPatch");
         }
     }
 
-    // -------------------------------------------------------------------------
-    // FeesPanelDisplayPatch
-    //
-    // Target: FeesPanelUI.LoadPanel()
-    // Type:   Postfix
-    //
-    // Vanilla: LoadPanel() is called each time the player opens the Fees UI.
-    //   It sets each slider's MaxValue from the hardcoded EconomyData.FeeMax
-    //   constants and its Value from the current EconomyData fee field.  These
-    //   FeeMax constants are fixed in the game binary and do not account for
-    //   our multiplier — at 2× the slider would be pinned at the top of its
-    //   vanilla range even though the actual fee is double the vanilla max.
-    //
-    // Mod: After vanilla LoadPanel() runs, ApplyB2FeesPanelOverrides() rewrites
-    //   each slider's min, max, step and value to the scaled range.  The direct
-    //   inner-Slider write strategy ensures vanilla's listeners cannot re-snap
-    //   the values during this correction.
-    //   Guarded on BaseFeeCacheInitialized: LoadPanel calls that arrive before
-    //   OnSaveLoaded has finished seeding the base cache are silently skipped.
-    //   FeesPanelInitPatch handles the correct initial write once the cache is
-    //   ready, so no panel state is lost by skipping early calls.
-    // -------------------------------------------------------------------------
+    // FeesPanelDisplayPatch — Postfix on FeesPanelUI.LoadPanel().
+    // Corrects slider min/max/step/value after vanilla sets them from hardcoded FeeMax.
+    // Guarded on BaseFeeCacheInitialized; early LoadPanel calls during session load are skipped.
     [HarmonyPatch(typeof(FeesPanelUI), "LoadPanel")]
     public static class FeesPanelDisplayPatch
     {
@@ -1261,24 +1034,9 @@ namespace ACEO_KTL_Economy_Tweaks
         }
     }
 
-    // -------------------------------------------------------------------------
-    // AirportRatingManagerInitCurvesPatch
-    //
-    // Target: AirportRatingManager.InitializeEvaluationCurves()
-    // Type:   Postfix
-    //
-    // Vanilla: InitializeEvaluationCurves() is called once at scene load and
-    //   builds all rating AnimationCurve fields using the hardcoded FeeMax
-    //   constants as x-axis anchors.  These curves are used by every subsequent
-    //   call to EvaluateRating() to convert a live fee value into a satisfaction
-    //   score for the GA, airline, and passenger report bars.
-    //
-    // Mod: After vanilla builds its curves, RefreshAirportRatingEvaluationCurves()
-    //   immediately replaces them with multiplier-scaled equivalents via
-    //   AccessTools reflection.  This ensures that from the very first rating
-    //   evaluation after load, the curves reflect our multiplier settings rather
-    //   than the vanilla FeeMax anchors.
-    // -------------------------------------------------------------------------
+    // AirportRatingManagerInitCurvesPatch — Postfix on InitializeEvaluationCurves().
+    // Replaces vanilla FeeMax-anchored curves with multiplier-scaled equivalents
+    // so satisfaction ratings read correctly in the Fees panel and report bars.
     [HarmonyPatch(typeof(AirportRatingManager), "InitializeEvaluationCurves")]
     public static class AirportRatingManagerInitCurvesPatch
     {
